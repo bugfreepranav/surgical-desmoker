@@ -229,6 +229,15 @@ def psnr(a, b):
     return 10 * np.log10(1 / max(mse, 1e-10))
 
 
+def subset(ds, n):
+    """Fixed random subset of n items (seed 0); n=None keeps everything."""
+    if not n or n >= len(ds):
+        return ds
+    idx = random.Random(0).sample(range(len(ds)), n)
+    print(f"using {n} of {len(ds)} pairs")
+    return torch.utils.data.Subset(ds, sorted(idx))
+
+
 @torch.no_grad()
 def evaluate(model, dl, dev):
     """Mean per-image PSNR of the clamped output on a paired loader."""
@@ -245,18 +254,22 @@ def evaluate(model, dl, dev):
 def train(args):
     t0 = time.time()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    model = SurgicalDesmoker(pretrained=not args.no_pretrained, mae_ckpt=args.mae_ckpt).to(dev)
+    size = tuple(args.size)
+    assert size[0] % 32 == 0 and size[1] % 32 == 0, "--size must be multiples of 32"
+    model = SurgicalDesmoker(img_size=size, pretrained=not args.no_pretrained, mae_ckpt=args.mae_ckpt).to(dev)
     if args.smoky_dir:   # real paired data
-        ds = PairedDataset(args.smoky_dir, args.clean_dir)
+        ds = PairedDataset(args.smoky_dir, args.clean_dir, size=size)
         smoke_w = 0.1 if args.smoke_w is None else args.smoke_w
     else:                # synthetic smoke from clean frames
-        ds = SmokeDataset(args.clean_dir)
+        ds = SmokeDataset(args.clean_dir, size=size)
         smoke_w = 0.1 if args.smoke_w is None else args.smoke_w
+    ds = subset(ds, args.max_train)
     dl = DataLoader(ds, batch_size=args.bs, shuffle=True,
                     num_workers=args.workers, drop_last=True)
     vdl = None
     if args.val_smoky_dir:
-        vds = PairedDataset(args.val_smoky_dir, args.val_clean_dir, train=False)
+        vds = PairedDataset(args.val_smoky_dir, args.val_clean_dir, size=size, train=False)
+        vds = subset(vds, args.max_val)
         vdl = DataLoader(vds, batch_size=args.bs, shuffle=False, num_workers=args.workers)
     best, best_path = -1.0, str(Path(args.out).with_name(Path(args.out).stem + "_best.pt"))
     opt = torch.optim.AdamW(model.parameters(), lr=1e-5)
@@ -291,11 +304,12 @@ def train(args):
 
 def infer(args):
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    model = SurgicalDesmoker(pretrained=False).to(dev).eval()
+    size = tuple(args.size)
+    model = SurgicalDesmoker(img_size=size, pretrained=False).to(dev).eval()
     model.load_state_dict(torch.load(args.ckpt, map_location=dev))
     img = Image.open(args.image).convert("RGB")
     orig = img.size
-    x = torch.from_numpy(np.asarray(img.resize(IMG_SIZE[::-1], Image.BICUBIC)).copy())
+    x = torch.from_numpy(np.asarray(img.resize(size[::-1], Image.BICUBIC)).copy())
     x = x.permute(2, 0, 1).float().div(255)[None].to(dev)
     J, S = model.predict(x)
     out = (J[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
@@ -324,6 +338,10 @@ if __name__ == "__main__":
     t.add_argument("--val_smoky_dir", default=None, help="validation smoky dir (enables best-checkpoint saving)")
     t.add_argument("--val_clean_dir", default=None)
     t.add_argument("--max_hours", type=float, default=None, help="stop gracefully after this many hours")
+    t.add_argument("--size", type=int, nargs=2, default=list(IMG_SIZE), metavar=("H", "W"),
+                   help="training resolution, multiples of 32 (e.g. 256 320)")
+    t.add_argument("--max_train", type=int, default=None, help="use only this many training pairs")
+    t.add_argument("--max_val", type=int, default=None, help="use only this many validation pairs")
     t.add_argument("--smoke_w", type=float, default=None, help="smoke-map loss weight (0 to disable)")
     t.add_argument("--epochs", type=int, default=300)
     t.add_argument("--bs", type=int, default=8)
@@ -335,5 +353,6 @@ if __name__ == "__main__":
     i.add_argument("--ckpt", required=True)
     i.add_argument("--image", required=True)
     i.add_argument("--out", default="clean.png")
+    i.add_argument("--size", type=int, nargs=2, default=list(IMG_SIZE), metavar=("H", "W"), help="must match training size")
     a = ap.parse_args()
     {"test": lambda: smoke_test(), "train": lambda: train(a), "infer": lambda: infer(a)}[a.cmd]()
