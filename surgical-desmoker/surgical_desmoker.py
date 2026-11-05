@@ -18,6 +18,7 @@ Usage:
 """
 import argparse
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -228,7 +229,21 @@ def psnr(a, b):
     return 10 * np.log10(1 / max(mse, 1e-10))
 
 
+@torch.no_grad()
+def evaluate(model, dl, dev):
+    """Mean per-image PSNR of the clamped output on a paired loader."""
+    model.eval()
+    tot, n = 0.0, 0
+    for smoky, clean, _ in dl:
+        J, _s = model(smoky.to(dev))
+        mse = ((J.clamp(0, 1).cpu() - clean) ** 2).flatten(1).mean(1).clamp(min=1e-10)
+        tot += (10 * torch.log10(1 / mse)).sum().item()
+        n += len(mse)
+    return tot / n
+
+
 def train(args):
+    t0 = time.time()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     model = SurgicalDesmoker(pretrained=not args.no_pretrained, mae_ckpt=args.mae_ckpt).to(dev)
     if args.smoky_dir:   # real paired data
@@ -239,6 +254,11 @@ def train(args):
         smoke_w = 0.1 if args.smoke_w is None else args.smoke_w
     dl = DataLoader(ds, batch_size=args.bs, shuffle=True,
                     num_workers=args.workers, drop_last=True)
+    vdl = None
+    if args.val_smoky_dir:
+        vds = PairedDataset(args.val_smoky_dir, args.val_clean_dir, train=False)
+        vdl = DataLoader(vds, batch_size=args.bs, shuffle=False, num_workers=args.workers)
+    best, best_path = -1.0, str(Path(args.out).with_name(Path(args.out).stem + "_best.pt"))
     opt = torch.optim.AdamW(model.parameters(), lr=1e-5)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-7)
     for ep in range(args.epochs):
@@ -253,8 +273,20 @@ def train(args):
             opt.step()
             run += loss.item(); n += 1
         sched.step()
-        print(f"epoch {ep + 1}/{args.epochs}  loss {run / n:.4f}  psnr(last batch) {psnr(J.detach(), clean):.2f}")
+        msg = f"epoch {ep + 1}/{args.epochs}  loss {run / n:.4f}  psnr(last batch) {psnr(J.detach(), clean):.2f}"
+        if vdl is not None:
+            vp = evaluate(model, vdl, dev)
+            msg += f"  val PSNR {vp:.2f}"
+            if vp > best:
+                best = vp
+                torch.save(model.state_dict(), best_path)
+                msg += "  (best, saved)"
+        elapsed = (time.time() - t0) / 3600
+        print(msg + f"  elapsed {elapsed:.2f}h", flush=True)
         torch.save(model.state_dict(), args.out)
+        if args.max_hours and elapsed > args.max_hours:
+            print("time budget reached, stopping early")
+            break
 
 
 def infer(args):
@@ -289,6 +321,9 @@ if __name__ == "__main__":
     t = sub.add_parser("train")
     t.add_argument("--clean_dir", required=True)
     t.add_argument("--smoky_dir", default=None, help="set to train on real paired data")
+    t.add_argument("--val_smoky_dir", default=None, help="validation smoky dir (enables best-checkpoint saving)")
+    t.add_argument("--val_clean_dir", default=None)
+    t.add_argument("--max_hours", type=float, default=None, help="stop gracefully after this many hours")
     t.add_argument("--smoke_w", type=float, default=None, help="smoke-map loss weight (0 to disable)")
     t.add_argument("--epochs", type=int, default=300)
     t.add_argument("--bs", type=int, default=8)
