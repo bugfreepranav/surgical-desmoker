@@ -189,6 +189,37 @@ class SmokeDataset(Dataset):
         return smoky, clean, smoke
 
 
+class PairedDataset(Dataset):
+    """Real paired data: smoky_dir and clean_dir with matching file stems
+    (e.g. smoky/video01_000123.png <-> clean/video01_000123.png).
+    Smoke-map target is derived from the pair difference (ASSUMPTION), since
+    real pairs come with no smoke annotation."""
+
+    def __init__(self, smoky_dir, clean_dir, size=IMG_SIZE, train=True):
+        exts = {".png", ".jpg", ".jpeg", ".bmp"}
+        index = lambda d: {p.stem: p for p in Path(d).rglob("*") if p.suffix.lower() in exts}
+        s, c = index(smoky_dir), index(clean_dir)
+        self.keys = sorted(set(s) & set(c))
+        assert self.keys, "no matching file stems between smoky_dir and clean_dir"
+        print(f"paired samples: {len(self.keys)}  (smoky {len(s)}, clean {len(c)})")
+        self.s, self.c, self.size, self.train = s, c, size, train
+
+    def __len__(self):
+        return len(self.keys)
+
+    def _load(self, p):
+        img = Image.open(p).convert("RGB").resize(self.size[::-1], Image.BICUBIC)
+        return torch.from_numpy(np.asarray(img).copy()).permute(2, 0, 1).float() / 255
+
+    def __getitem__(self, i):
+        k = self.keys[i]
+        smoky, clean = self._load(self.s[k]), self._load(self.c[k])
+        if self.train and random.random() < 0.5:
+            smoky, clean = smoky.flip(-1), clean.flip(-1)
+        smoke = (smoky - clean).abs().mean(0, keepdim=True).clamp(0, 1)
+        return smoky, clean, smoke
+
+
 # --------------------------------------------------------------------------- #
 # Train / infer
 # --------------------------------------------------------------------------- #
@@ -200,7 +231,13 @@ def psnr(a, b):
 def train(args):
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     model = SurgicalDesmoker(pretrained=not args.no_pretrained, mae_ckpt=args.mae_ckpt).to(dev)
-    dl = DataLoader(SmokeDataset(args.clean_dir), batch_size=args.bs, shuffle=True,
+    if args.smoky_dir:   # real paired data
+        ds = PairedDataset(args.smoky_dir, args.clean_dir)
+        smoke_w = 0.1 if args.smoke_w is None else args.smoke_w
+    else:                # synthetic smoke from clean frames
+        ds = SmokeDataset(args.clean_dir)
+        smoke_w = 0.1 if args.smoke_w is None else args.smoke_w
+    dl = DataLoader(ds, batch_size=args.bs, shuffle=True,
                     num_workers=args.workers, drop_last=True)
     opt = torch.optim.AdamW(model.parameters(), lr=1e-5)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-7)
@@ -210,7 +247,7 @@ def train(args):
         for smoky, clean, smoke in dl:
             smoky, clean, smoke = smoky.to(dev), clean.to(dev), smoke.to(dev)
             J, S = model(smoky)
-            loss = F.l1_loss(J, clean) + 0.1 * F.l1_loss(S, smoke)
+            loss = F.l1_loss(J, clean) + smoke_w * F.l1_loss(S, smoke)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
@@ -251,6 +288,8 @@ if __name__ == "__main__":
     sub.add_parser("test")
     t = sub.add_parser("train")
     t.add_argument("--clean_dir", required=True)
+    t.add_argument("--smoky_dir", default=None, help="set to train on real paired data")
+    t.add_argument("--smoke_w", type=float, default=None, help="smoke-map loss weight (0 to disable)")
     t.add_argument("--epochs", type=int, default=300)
     t.add_argument("--bs", type=int, default=8)
     t.add_argument("--workers", type=int, default=4)
